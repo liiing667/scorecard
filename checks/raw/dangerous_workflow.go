@@ -45,6 +45,7 @@ func containsUntrustedContextPattern(variable string) bool {
 			`head_commit\.author\.name|` +
 			`commits.*\.author\.email|` +
 			`commits.*\.author\.name|` +
+			`inputs\..*|` +
 			`blocked_user\.name|` +
 			`blocked_user\.email|` +
 			`pull_request\.head\.ref|` +
@@ -54,10 +55,21 @@ func containsUntrustedContextPattern(variable string) bool {
 	if strings.Contains(variable, "github.head_ref") {
 		return true
 	}
+	// Workflow inputs are supplied by whoever triggers the workflow
+	// (workflow_dispatch, workflow_call), so the inputs context is
+	// attacker-controlled. This also catches expressions that smuggle
+	// untrusted data through a function call, such as
+	// fromJSON(inputs.payload).title.
+	untrustedInputsPattern := regexp.MustCompile(`(^|[^\w.])inputs\.`)
+	if untrustedInputsPattern.MatchString(variable) {
+		return true
+	}
 	// Check for toJSON() serializing github context or event objects.
 	// These contain untrusted data and are dangerous in shell contexts.
 	// See https://github.com/ossf/scorecard/issues/3554
-	dangerousToJSONPattern := regexp.MustCompile(`(?i)tojson\s*\(\s*github(\.event)?\s*\)`)
+	// Any subpath of github.event (e.g. github.event.pull_request) also
+	// serializes attacker-controlled fields such as the pull request title.
+	dangerousToJSONPattern := regexp.MustCompile(`(?i)tojson\s*\(\s*github(\.event(\.[^)\s]*)?)?\s*\)`)
 	if dangerousToJSONPattern.MatchString(variable) {
 		return true
 	}
@@ -232,6 +244,7 @@ func validateScriptInjection(workflow *ghworkflow.Workflow, path string,
 		if job == nil {
 			continue
 		}
+		untrustedMatrix := untrustedMatrixValues(job)
 		for _, step := range job.Steps {
 			if step == nil {
 				continue
@@ -241,7 +254,7 @@ func validateScriptInjection(workflow *ghworkflow.Workflow, path string,
 				continue
 			}
 			// Check Run *String for user-controllable (untrustworthy) properties.
-			if !checkVariablesInScript(run.Run.Value, run.Run.Pos, job, path, pdata) && dl != nil {
+			if !checkVariablesInScript(run.Run.Value, run.Run.Pos, job, path, pdata, untrustedMatrix) && dl != nil {
 				// GitHub rejects a workflow with an unclosed expression, so it can't
 				// run. Note it and keep checking the other workflows.
 				dl.Debug(&checker.LogMessage{
@@ -255,11 +268,71 @@ func validateScriptInjection(workflow *ghworkflow.Workflow, path string,
 	}
 }
 
+// matrixRefPattern extracts the dimension name from a matrix context
+// reference such as `matrix.title`.
+var matrixRefPattern = regexp.MustCompile(`matrix\.([A-Za-z0-9_-]+)`)
+
+// untrustedMatrixValues returns the names of the job's matrix dimensions
+// whose values embed untrusted context, so that a ${{ matrix.name }}
+// reference in a run script can be traced back to attacker-controlled data.
+func untrustedMatrixValues(job *ghworkflow.Job) map[string]bool {
+	untrusted := make(map[string]bool)
+	if job == nil || job.Strategy == nil || job.Strategy.Matrix == nil {
+		return untrusted
+	}
+	matrix := job.Strategy.Matrix
+	for name, row := range matrix.Rows {
+		if row == nil {
+			continue
+		}
+		for _, value := range row.Values {
+			if containsUntrustedExpression(value) {
+				untrusted[name] = true
+			}
+		}
+	}
+	if matrix.Include != nil {
+		for _, combination := range matrix.Include.Combinations {
+			if combination == nil {
+				continue
+			}
+			for name, assign := range combination.Assigns {
+				if assign == nil {
+					continue
+				}
+				if containsUntrustedExpression(assign.Value) {
+					untrusted[name] = true
+				}
+			}
+		}
+	}
+	return untrusted
+}
+
+// containsUntrustedExpression reports whether any ${{ }} expression in s
+// references untrusted context.
+func containsUntrustedExpression(s string) bool {
+	for {
+		start := strings.Index(s, "${{")
+		if start == -1 {
+			return false
+		}
+		end := strings.Index(s[start:], "}}")
+		if end == -1 {
+			return false
+		}
+		if containsUntrustedContextPattern(s[start+3 : start+end]) {
+			return true
+		}
+		s = s[start+end:]
+	}
+}
+
 // checkVariablesInScript records script injections in script. It returns false if
 // script has a ${{ with no closing }}.
 func checkVariablesInScript(script string, pos *ghworkflow.Pos,
 	job *ghworkflow.Job, path string,
-	pdata *checker.DangerousWorkflowData,
+	pdata *checker.DangerousWorkflowData, untrustedMatrix map[string]bool,
 ) bool {
 	for {
 		s := strings.Index(script, "${{")
@@ -278,7 +351,7 @@ func checkVariablesInScript(script string, pos *ghworkflow.Pos,
 
 		// Check if the variable may be untrustworthy.
 		variable := script[s+3 : s+e]
-		if containsUntrustedContextPattern(variable) {
+		if containsUntrustedContextPattern(variable) || referencesUntrustedMatrixValue(variable, untrustedMatrix) {
 			line := fileparser.GetLineNumber(pos)
 			pdata.Workflows = append(pdata.Workflows,
 				checker.DangerousWorkflow{
@@ -296,4 +369,15 @@ func checkVariablesInScript(script string, pos *ghworkflow.Pos,
 		script = script[s+e:]
 	}
 	return true
+}
+
+// referencesUntrustedMatrixValue reports whether variable reads a matrix
+// dimension whose values contain untrusted context.
+func referencesUntrustedMatrixValue(variable string, untrustedMatrix map[string]bool) bool {
+	for _, match := range matrixRefPattern.FindAllStringSubmatch(variable, -1) {
+		if untrustedMatrix[match[1]] {
+			return true
+		}
+	}
+	return false
 }

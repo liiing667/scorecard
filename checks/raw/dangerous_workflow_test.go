@@ -117,9 +117,9 @@ func TestUntrustedContextVariables(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "toJSON github.event subfield ignored",
+			name:     "toJSON github.event subfield",
 			variable: "toJSON(github.event.pull_request)",
-			expected: false,
+			expected: true,
 		},
 		{
 			name:     "toJSON case insensitive",
@@ -134,6 +134,26 @@ func TestUntrustedContextVariables(t *testing.T) {
 		{
 			name:     "toJSON safe property",
 			variable: "toJSON(github.repository)",
+			expected: false,
+		},
+		{
+			name:     "fromJSON inputs",
+			variable: "fromJSON(inputs.payload).title",
+			expected: true,
+		},
+		{
+			name:     "inputs context",
+			variable: "inputs.payload",
+			expected: true,
+		},
+		{
+			name:     "github event inputs",
+			variable: "github.event.inputs.payload",
+			expected: true,
+		},
+		{
+			name:     "matrix reference without job context",
+			variable: "matrix.title",
 			expected: false,
 		},
 	}
@@ -213,6 +233,26 @@ func TestGithubDangerousWorkflow(t *testing.T) {
 			name:     "run toJSON script injection",
 			filename: ".github/workflows/github-workflow-dangerous-pattern-untrusted-script-injection-tojson.yml",
 			expected: ret{nb: 1},
+		},
+		{
+			name:     "run toJSON pull request script injection",
+			filename: ".github/workflows/github-workflow-dangerous-pattern-untrusted-script-injection-tojson-pullrequest.yml",
+			expected: ret{nb: 1},
+		},
+		{
+			name:     "run fromJSON inputs script injection",
+			filename: ".github/workflows/github-workflow-dangerous-pattern-untrusted-script-injection-fromjson-inputs.yml",
+			expected: ret{nb: 1},
+		},
+		{
+			name:     "run matrix script injection",
+			filename: ".github/workflows/github-workflow-dangerous-pattern-untrusted-script-injection-matrix.yml",
+			expected: ret{nb: 1},
+		},
+		{
+			name:     "run trusted matrix script injection",
+			filename: ".github/workflows/github-workflow-dangerous-pattern-trusted-script-injection-matrix.yml",
+			expected: ret{nb: 0},
 		},
 	}
 	for _, tt := range tests {
